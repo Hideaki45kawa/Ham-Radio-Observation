@@ -1,0 +1,273 @@
+// using alsa device audio real fft program for HRO(HAM RADIO OBSERVATION)
+
+// By Hideaki YOKOKAWA (NMS)
+// ver.2.0 
+
+//
+// http://equalarea.com/paul/alsa-audio.html#captureex
+// http://www.fftw.org/fftw2_doc/fftw_2.html
+// using pthread 
+
+// for compile gcc threcfft.c -lm  -lrfftw -lfftw -lasound -pthread -orecfft 
+// using fftw , alsa library
+
+
+/*
+Copyright (C) 2019 HIDEAKI YOKOKAWA
+
+This library is free software; you can redistribute it and/or
+modify it under the terms of the GNU Library General Public
+License as published by the Free Software Foundation; either
+version 2 of the License, or (at your option) any later version.
+
+This library is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+Library General Public License for more details.
+
+You should have received a copy of the GNU Library General Public
+License along with this library; if not, write to the
+Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
+Boston, MA  02110-1301, USA.
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <fftw.h>
+#include <rfftw.h>
+#include <alsa/asoundlib.h>
+
+#include <time.h>
+#include <unistd.h>
+#include <getopt.h>
+
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <signal.h>
+
+#define NN 44100+1
+#define HN 44100/2+1
+
+struct timespec tp1,tp2;
+
+pthread_t calc_psd;
+pthread_t save_th;
+
+snd_pcm_t *capture_handle;
+snd_pcm_hw_params_t *hw_params;
+
+rfftw_plan p;
+
+static char args[255];
+static char filename[512];
+char sw;
+char sw2;
+unsigned int ti;
+static double out_psd[HN+1];
+static char Time_string[256],Times[128];
+
+short buf0[NN];
+short buf1[NN];
+
+
+//CTRL+C detect
+
+void  INThandler(int sig)
+{
+    printf("Interrupt CTRL+C or TERMINATE process\n"); 
+            printf("exit program\n");
+// free handle
+snd_pcm_close (capture_handle);
+ rfftw_destroy_plan(p);
+    exit(-1);
+}
+
+char get10min(void)
+{
+    time_t now;
+    struct tm tm;
+    now = time(0);
+        localtime_r(&now,&tm);
+
+       if ((tm.tm_sec == 0 ) && ((tm.tm_min) % 10 == 0) ){return 1;}else {return 0;}
+
+}
+
+void getdaytime ( char Time_string[],char Times[]) {
+    time_t now;
+    struct tm tm;
+
+    now = time(0);
+        localtime_r(&now,&tm);
+
+
+    sprintf (Time_string,"%04d%02d%02d_%02d%02d%02d.dat",
+        tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+    sprintf (Times,"%02d:%02d:%02d",tm.tm_hour, tm.tm_min,tm.tm_sec);
+
+    return;
+}
+
+
+void save_t(short maxi)
+{
+    // if time up save data
+       FILE *fp;
+      int k;
+              printf("saving %s / level:%d\n",Times,maxi);
+             fp=fopen(filename,"a+");
+                        for (k=0;k<HN-1;k++) fprintf(fp,"% 18.8e ",20*log10(out_psd[k]));
+             fprintf(fp,"\n");
+        fclose(fp);
+}
+
+void psd(int N)
+    {
+     fftw_real in[N], out[N], power_spectrum[N/2+1];
+
+      int i,k;
+        short maxi=-32767;
+     p = rfftw_create_plan(N, FFTW_REAL_TO_COMPLEX, FFTW_ESTIMATE);
+
+        if (sw==0){for (i=0;i<N;i++){in[i]=(double)buf0[i];
+                        if (maxi < abs(buf0[i])) maxi=abs(buf0[i]);
+                         }  } else{
+                    for (i=0;i<N;i++){in[i]=(double)buf1[i];
+                           if (maxi < abs(buf1[i])) maxi=abs(buf1[i]);
+                        } }  
+
+     rfftw_one(p, in, out);
+     power_spectrum[0] = out[0]*out[0];  /* DC component */
+     for (k = 1; k < (N+1)/2; ++k)  /* (k < N/2 rounded up) */
+          power_spectrum[k] = out[k]*out[k] + out[N-k]*out[N-k];
+     if (N % 2 == 0) /* N is even */
+          power_spectrum[N/2] = out[N/2]*out[N/2];  /* Nyquist freq. */
+     for (i=0;i<(N/2);i++)out_psd[i]=power_spectrum[i];
+           save_t(maxi);
+        ti++;
+     rfftw_destroy_plan(p);
+}
+
+ void* psd_thread(void *args)
+{
+    // caliculate powerspectrum 
+    psd(NN-1);
+}
+
+ 
+
+  int main (int argc, char *argv[])
+	{
+		int i,k;
+		int err;
+		
+                double in[NN];
+                double out[HN];
+             FILE *fo;
+              unsigned int  srate=NN-1;
+
+		if ((err = snd_pcm_open (&capture_handle, argv[1], SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+			fprintf (stderr, "cannot open audio device %s (%s)\n", 
+				 argv[1],
+				 snd_strerror (err));
+			exit (1);
+		}
+		   
+		if ((err = snd_pcm_hw_params_malloc (&hw_params)) < 0) {
+			fprintf (stderr, "cannot allocate hardware parameter structure (%s)\n",
+				 snd_strerror (err));
+			exit (1);
+		}
+				 
+		if ((err = snd_pcm_hw_params_any (capture_handle, hw_params)) < 0) {
+			fprintf (stderr, "cannot initialize hardware parameter structure (%s)\n",
+				 snd_strerror (err));
+			exit (1);
+		}
+	
+		if ((err = snd_pcm_hw_params_set_access (capture_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
+			fprintf (stderr, "cannot set access type (%s)\n",
+				 snd_strerror (err));
+			exit (1);
+		}
+	
+		if ((err = snd_pcm_hw_params_set_format (capture_handle, hw_params, SND_PCM_FORMAT_S16_LE)) < 0) {
+			fprintf (stderr, "cannot set sample format (%s)\n",
+				 snd_strerror (err));
+			exit (1);
+		}
+ 	
+		if ((err = snd_pcm_hw_params_set_rate_near (capture_handle, hw_params, &srate, 0)) < 0) {
+			fprintf (stderr, "cannot set sample rate (%s)\n",
+				 snd_strerror (err));
+			exit (1);
+		}
+	
+		if ((err = snd_pcm_hw_params_set_channels (capture_handle, hw_params, 1)) < 0) {
+			fprintf (stderr, "cannot set channel count (%s)\n",
+				 snd_strerror (err));
+			exit (1);
+		}
+	
+		if ((err = snd_pcm_hw_params (capture_handle, hw_params)) < 0) {
+			fprintf (stderr, "cannot set parameters (%s)\n",
+				 snd_strerror (err));
+			exit (1);
+		}
+     
+		snd_pcm_hw_params_free (hw_params);
+	
+		if ((err = snd_pcm_prepare (capture_handle)) < 0) {
+			fprintf (stderr, "cannot prepare audio interface for use (%s)\n",
+				 snd_strerror (err));
+			exit (1);
+		}
+
+//CTRL+C process
+             signal(SIGINT, INThandler);
+             signal(SIGTERM, INThandler);
+ti=0;
+        sw2=0;
+//read to fft loop
+ while(2){
+       getdaytime (Time_string,Times);
+          sprintf(filename,"%s/%s",argv[2],Time_string);
+          printf("%d %s \n",sw2,filename);
+		while(2){
+                         getdaytime (Time_string,Times);
+                           if (sw==0){
+			if ((err = snd_pcm_readi (capture_handle, buf0, NN-1)) != (NN-1)) {
+				fprintf (stderr, "read from audio interface failed (%s)\n",
+					 snd_strerror (err));
+				exit (1);} else { sw=1; // non error  : goto thread if time up , save data 
+                                                        pthread_create( &calc_psd, NULL, psd_thread, (void *)NULL );
+                                                            }
+			}else {
+			if ((err = snd_pcm_readi (capture_handle, buf1, NN-1)) != (NN-1)) {
+				fprintf (stderr, "read from audio interface failed (%s)\n",
+					 snd_strerror (err));
+				exit (1);} else { sw=0; // non error  : goto thread if time up , save data 
+                                                     pthread_create( &calc_psd, NULL, psd_thread, (void *)NULL );
+                                                              }
+                                     }
+                                              pthread_join(calc_psd,NULL);
+   if(ti >600 ||  get10min() ==1 ) {  fo=fopen("filename.dat","wt");
+      fprintf(fo,"%s",filename); 
+        fclose(fo);
+sw2=sw2^1; 
+                         ti=0;
+                                 break;} 	  
+           }
+
+}      
+ 		snd_pcm_close (capture_handle);
+		exit (0);
+	}
+
+
